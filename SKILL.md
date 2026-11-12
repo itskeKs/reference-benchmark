@@ -44,8 +44,9 @@ Settle with the user, in one short round:
 4. **Reference and its quality.** Hand-verified gold, or a "silver" reference produced by
    another system? With silver, every metric means *agreement with that system* — say so
    in every report header.
-5. **Pass criteria**, written down before the first run (e.g. "recall ≥ 80 %, zero
-   invented facts, ≤ 5 min on device").
+5. **Primary metric and pass criteria**, written down before the first run (e.g.
+   "recall ≥ 80 %, zero invented facts, ≤ 5 min on device"). With `bench.py` these go
+   into `bench.json` as `primary_metric` and `criteria`, so every run gets a pass column.
 6. **Where history lives.** Outside the repo when fixtures or outputs are sensitive
    (`~/<project>-benchmarks/<suite>/`, dirs 0700, files 0600). Never commit real data.
 
@@ -66,8 +67,24 @@ need to quantify *how much better* a fix is.
   number words, whitespace, label names. Document every rule in the report header.
 - For generated-text tasks: write the fact checklist / expected structure per fixture
   **before** reading any outputs. Keep a **holdout** split that is never used for tuning.
+- Many small cases (invoices, queries, notes) are **items** of one fixture set: one
+  directory of inputs, one of gold, and a `splits.json` assigning each item to `train` or
+  `holdout`. Tune on train; look at holdout only for the finally chosen config.
+- If the system **learns from gold** (a classifier, a fitted ranker), its train score is
+  memorized fit, not quality: rank on a `dev` split or cross-validation instead, and make
+  sure the driver only reads gold for training items — never for holdout.
+- Report quality metrics per split (`train.f1`, `holdout.f1`). A metric over all items
+  silently includes holdout and leaks it.
+- Make sure every tunable can actually change the outcome on your fixture: an option
+  that never triggers (e.g. date order when no day is above 12) looks "inert" only
+  because the fixture lacks the case. Add the case.
 
 ## Phase 2 — Driver
+
+For a pure function (a parser, a ranker, a prompt against a local model), the driver is a
+few lines that run it over the fixture and write `result.json`; skip the device-oriented
+points below (guard, liveness, telemetry, state restore). They matter for phones,
+GPUs, shared services and long runs.
 
 - One command runs one config end to end and writes a machine-readable `result.json`
   (outputs + per-stage timings + environment telemetry). No interactive steps.
@@ -105,9 +122,21 @@ need to quantify *how much better* a fix is.
   no real DER), compute an honest **proxy** and label it a proxy.
 - Metrics read only `result.json` + reference → same inputs, same numbers. Output
   `metrics.json` (flat, for the index) and `metrics.md` (for humans).
-- **Automatic scorers and LLM judges must be calibrated** before you trust them: score a
-  set of runs by hand, compare (MAE, bias, max error, per-item accuracy), tune thresholds
-  with cross-validation, and publish the calibration table. Keep the human score as the
+- For many-item fixtures, also write a per-item result (`items.json`: id, split, score,
+  pass, detail) so runs can be compared item by item, not just in aggregate.
+- **Automatic scorers and LLM judges must be calibrated** before you trust them:
+  1. Split items into folds **before** looking at any output (deterministic seed).
+  2. Hand-score a blinded sample — the rater must not see which run or config produced
+     an output, nor the automatic score. Aim for ≥ 30 scored units (item × run); say
+     which unit you use (per item-run is usually right; per run hides compensating errors).
+  3. Compare auto vs. human: MAE, bias (sign matters — a scorer that is always generous
+     inflates every run), max abs error, share within a tolerance, correlation, and
+     agreement for pass/fail verdicts.
+  4. Tune scorer rules/thresholds on one fold only, report the other fold as held out.
+  5. Calibrate screens for forbidden content separately: keyword screens over-fire on
+     quoted or negated context ("he did *not* mention salary"), so measure their
+     precision too, not just recall.
+  Publish the calibration table next to the results; keep the human score as the
   tie-breaker for close calls.
 
 ## Phase 4 — Diff: where, not how often
@@ -115,8 +144,12 @@ need to quantify *how much better* a fix is.
 Aggregate numbers say *that* something is worse; the diff says *where*. Produce `diff.md`
 per run: aligned per segment (turn, page, record, query), segment-level metric, inline
 markup (`[-deleted-]`, `[+inserted+]`, `[ref→hyp]`), and highlighted error regions (e.g.
-swap regions). Read the diff before proposing any fix — it often shows the error is not
-where the aggregate suggests.
+swap regions). For structured outputs: per record, which field is wrong, with expected vs.
+actual and the source context. Read the diff before proposing any fix — it often shows the
+error is not where the aggregate suggests.
+
+Between two runs, compare **per item**: which items regressed, improved or flipped
+pass/fail. An unchanged average can hide a regression on exactly the items that matter.
 
 ## Phase 5 — History, index, compare
 
@@ -127,6 +160,9 @@ where the aggregate suggests.
 - `index` rebuilds `index.json` + `index.md` from the run dirs (derived state; tolerate
   partial or legacy dirs) after **every** attempt: one row per run, columns = config keys
   + metric keys + status/attempt. `compare A B …` shows deltas against the first run.
+- Re-scoring an old run never rewrites what it was run on: if a fixture changed since,
+  refuse (or record the drift explicitly) and keep the previous metrics. Compare only
+  runs with the same fixture fingerprint, or say loudly that they differ.
 - Manifests, index and sweep summaries contain **no content** (no transcript text, no
   outputs) — only config, hashes, numbers. Content stays in the per-run artifacts.
 
@@ -140,10 +176,16 @@ where the aggregate suggests.
   config does not abort the sweep. Attribute output to a config by the run id that run
   actually created (never "latest dir with a matching name"), so a failed config never
   inherits an older run.
+- Parameters that only apply to one variant (k1/b only for BM25) are not a cartesian
+  product: list those combinations explicitly instead of sweeping a full matrix.
+- Rank by the primary metric; on ties prefer the config closest to the current default,
+  then the cheapest one. Report ties as ties.
 - Don't change a production default because one fixture improved; a sweep winner is a
   candidate for a broader check, not a decision.
 - Check determinism once: run the baseline twice. Identical quality → one run per config
-  is enough; otherwise repeat and report spread.
+  is enough; otherwise repeat and report spread. Timing is always noisy: repeat timing
+  measurements (or time many iterations inside the driver) and report mean ± sd, never
+  a single number; process wall time of the whole run is not a latency measurement.
 - Long sweeps run in the background as a direct child of the shell; never let a verifier
   or helper agent start the real driver (it may kill the running sweep on abort) — agents
   get dry-run/stub only.
@@ -162,26 +204,73 @@ trusting the first real number.
 - Record durable results (what was measured, on which fixture/commit, what was decided,
   dead ends) in the project's docs or memory, so nobody repeats a dead experiment.
 
-## Bundled tools (optional, stdlib Python ≥ 3.9)
-
-- `scripts/bench.py` — generic harness wrapping any project driver + metrics command via a
-  `bench.json` config. Subcommands: `init` (starter config + stub driver/metrics + sample
-  fixtures), `run` (`--label`, `--set k=v`, `--retries`, `--timeout-seconds`, `--driver`,
-  `--dry-run`), `sweep --spec`, `metrics --run ID` (re-score offline), `index`, `compare`.
-  Contract: the driver gets `BENCH_RUN_DIR`, `BENCH_CONFIG`, `BENCH_FIXTURE_<NAME>` and
-  writes `result.json`; exit 75 = transient/killed (retried). The metrics command writes a
-  flat `metrics.json` (+ optional `metrics.md`, `diff.md`). Full contract: `bench.py -h`.
-- `scripts/textdiff.py` — exact token alignment (S/D/I, WER; bit-parallel, fast on 10k+
-  tokens), per-segment reports, attributed WER with label mapping and mismatch regions,
-  top errors, inline diff markup. Importable or CLI (`textdiff.py REF HYP --markdown-out F`).
-- Self-test: `python3 -m unittest discover -s scripts/tests` (67 tests, ~30 s).
-
-Quick start in a project: `python3 <skill>/scripts/bench.py init bench/`, then replace the
-stub driver with one that runs the real system and the stub metrics with task metrics.
+## Bundled tools (optional, stdlib Python ≥ 3.9, no dependencies)
 
 Use them when the project has no harness yet; when it has one, follow and extend the
-project's own. Copy the scripts into the project (e.g. `scripts/bench/`) rather than
-calling them from the skill directory, so the project stays self-contained.
+project's own. Start with `init`, which **copies** the tools into the project so it stays
+self-contained:
+
+```
+python3 <skill-dir>/scripts/bench.py init bench/ --template items   # or --template text
+```
+
+- `text` template: one input text vs. one reference text (WER-style, uses `textdiff.py`).
+- `items` template: many items + gold + `splits.json`, per-item scoring (field-level
+  P/R/F1 and exact match for records; accuracy, macro-F1, per-class P/R/F1 and a
+  confusion matrix for single labels), `items.json`, per-item diff. Use it for extraction,
+  classification, ranking, checklists — anything with many small cases.
+
+Then replace `bench_stub_driver.py` with a driver for the real system and
+`bench_stub_metrics.py` with task metrics (see the metrics catalog).
+
+**Contract.** bench runs the driver and the metrics command with cwd = the `bench.json`
+directory and env `BENCH_RUN_DIR`, `BENCH_CONFIG` (merged config JSON), and
+`BENCH_FIXTURE_<NAME>` per fixture. The driver writes `result.json`
+(`schema_version`, `status: success|error`); exit 75 means transient/killed and is
+retried. The metrics command writes a flat `metrics.json`, optionally `metrics.md`,
+`diff.md`, `diff.json` and `items.json`. Full details: `bench.py -h`, `bench.py sweep --explain`.
+
+**`bench.json` keys:** `suite`, `history_root`, `fixtures`, `driver`, `metrics`,
+`defaults` (every tunable; `--set` and sweeps reject unknown keys unless
+`allow_new_keys`, and values whose type differs from the default), `timeout_seconds`, `retries`, `guard` (+ `guard_quiet_seconds`,
+`guard_poll_seconds`, `guard_max_wait_seconds`), `index_columns`, `provenance` (extra paths
+to hash as code identity), `primary_metric` (`{"name", "goal": "max"|"min"}`), `criteria`
+(`{"f1": ">=0.8", "invented": "==0"}` → pass column), `timing_keys` (excluded from the
+determinism check, shown as mean ± sd), `holdout_split` (hides `holdout.*` and every
+metric not namespaced to a visible split unless `--show-holdout`), `rank_split` (split
+used for ranking and criteria, default `train`; use `dev`/`cv` for systems that fit on
+gold), `public_metrics` (unsplit metrics that may stay visible, globs allowed).
+
+**Split conventions.** Metrics scripts emit split-prefixed quality metrics (`train.f1`,
+`dev.f1`, `holdout.f1`); `all.*` is reserved for aggregates over every item. Criteria and
+sweep ranking use `<rank_split>.<metric>`. bench passes `BENCH_HOLDOUT_SPLIT` and
+`BENCH_RANK_SPLIT` to the driver and metrics; a fitting driver reads gold only for
+training ids. Metrics scripts omit holdout detail from `metrics.md`/`diff.md` unless
+`BENCH_SHOW_HOLDOUT=1`, which bench sets only for `metrics RUN --show-holdout` — the final
+check on the chosen config, followed by `compare … --show-holdout`.
+
+**Commands** (run ids accept a unique prefix or a label; `--latest` picks the newest):
+
+| Command | Purpose |
+|---|---|
+| `run --label L [--set k=v] [--repeat N] [--retries N] [--timeout-seconds S] [--driver CMD] [--dry-run]` | one config end to end |
+| `sweep --spec F` / `sweep --explain` | run a config list and/or matrix; ranked summary |
+| `metrics RUN… / --all / --label-glob P / --group G / --sweep NAME [--env K=V] [--force] [--show-holdout]` | re-score offline; previous results move to `prev/`; refuses on fixture drift without `--force` |
+| `index` | rebuild `index.json` / `index.md` |
+| `compare RUN… [--sort M] [--top N] [--columns …] [--show-holdout]` | ranked table, deltas vs. first run, warnings on fixture or code changes |
+| `items A B [--split S] [--threshold X]` | per-item regressed / improved / unchanged |
+| `stats --group G` / `determinism RUN… \| --group G` | mean, sd, cv for repeats / exit 1 if quality metrics differ (`--group` takes the run label) |
+
+`scripts/textdiff.py`: exact token alignment (S/D/I, WER; bit-parallel, fast on 10k+
+tokens), per-segment reports, attributed WER with label mapping and mismatch regions,
+top errors, inline markup. Importable or CLI.
+
+`scripts/calibrate.py`: `sheet` builds a blinded, shuffled hand-scoring CSV from
+`items.json` of several runs (the key stays in a separate private file); `score` compares
+auto vs. human scores (MAE, bias, max error, within-tolerance share, r, pass agreement),
+optionally per fold.
+
+Self-test: `python3 -m unittest discover -s scripts/tests` (167 tests, about 80 s).
 
 ## Cleanup
 

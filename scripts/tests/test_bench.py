@@ -4,11 +4,13 @@ Everything runs in temp dirs with the CLI as a subprocess (so umask, signals and
 real); a few unit-level checks import bench directly. No file is left behind and no stub driver
 survives a test (killed-process checks use the pid the stub writes to pid.txt).
 """
+import atexit
 import contextlib
 import hashlib
 import io
 import json
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -38,6 +40,22 @@ open(os.environ["BENCH_RUN_DIR"] + "/result.json", "w").write(json.dumps(
 '''
 
 
+_TEMPLATE = {}
+
+
+def init_template():
+    """The output of `bench.py init` (text template), made once per test process: copying it into each test's temp dir
+    is much cheaper than one init subprocess per test. The init command itself has its own tests."""
+    if "dir" not in _TEMPLATE:
+        tmp = tempfile.TemporaryDirectory(prefix="bench-template-")
+        atexit.register(tmp.cleanup)
+        target = Path(tmp.name) / "proj"
+        done = subprocess.run([sys.executable, BENCH, "init", str(target)], capture_output=True, text=True, timeout=60)
+        assert done.returncode == 0, done.stderr
+        _TEMPLATE["dir"] = target
+    return _TEMPLATE["dir"]
+
+
 def pid_alive(pid):
     try:
         os.kill(pid, 0)
@@ -53,9 +71,10 @@ class BenchCase(unittest.TestCase):
         self.tmp = Path(tmp.name)
         self.proj = self.tmp / "proj"
         self.hist = self.tmp / "history"  # not created until a command needs it
-        self.assertEqual(self.bench("init", str(self.proj), config=False).returncode, 0)
+        shutil.copytree(init_template(), self.proj)
         self.conf = self.proj / "bench.json"
-        self.update_config(history_root=str(self.hist))
+        # the stub driver's fault-injection keys (fail, fail_attempts) and ad-hoc keys are not in defaults
+        self.update_config(history_root=str(self.hist), allow_new_keys=True)
 
     # ---- helpers
     def update_config(self, **changes):
@@ -181,7 +200,7 @@ class RunTests(BenchCase):
         r = self.run_label("ok")
         self.assertEqual(r.returncode, 0, r.stderr)
         rid = self.only_run()
-        self.assertRegex(rid, r"^\d{8}T\d{6}Z_ok$")
+        self.assertRegex(rid, r"^\d{8}T\d{9}Z_ok$")  # millisecond resolution, no dots
         run = self.run_json(rid)
         self.assertEqual((run["schema_version"], run["run_id"], run["label"], run["suite"]), (1, rid, "ok", "starter"))
         self.assertEqual((run["status"], run["error_code"], run["attempt"], run["attempts_allowed"]), ("success", None, 1, 1))
@@ -417,8 +436,8 @@ class IndexTests(BenchCase):
         self.run_label("two", "--set", "alpha=2")
         header = next(l for l in (self.hist / "index.md").read_text().splitlines() if l.startswith("| run_id"))
         cols = [c.strip() for c in header.strip("|").split("|")]
-        self.assertEqual(cols, ["run_id", "label", "status", "attempt", "alpha", "drop_every", "zeta",
-                                "D", "I", "N_hyp", "N_ref", "S", "wer"])
+        self.assertEqual(cols, ["run_id", "label", "status", "attempt", "error_code", "fixtures", "pass", "alpha", "drop_every",
+                                "zeta", "D", "I", "N_hyp", "N_ref", "S", "wer"])
 
     def test_empty_history_and_column_name_clash(self):
         self.assertEqual(self.bench("index").returncode, 0)
@@ -466,8 +485,10 @@ class CompareTests(BenchCase):
         out = self.tmp / "rev.json"
         self.bench("compare", self.b, self.a, "--json-out", str(out))
         comp = json.loads(out.read_text())
-        self.assertEqual(comp["baseline"], self.b)
-        self.assertLess(comp["rows"][1]["deltas"]["wer"], 0)
+        self.assertEqual(comp["baseline"], self.b)  # the primary metric ranks the rows (a first); deltas stay vs b
+        rows = {r["run_id"]: r for r in comp["rows"]}
+        self.assertIsNone(rows[self.b]["deltas"]["wer"])
+        self.assertLess(rows[self.a]["deltas"]["wer"], 0)
 
     def test_columns_option_and_unknown_run(self):
         out = self.tmp / "cols.json"
@@ -512,7 +533,8 @@ class SweepTests(BenchCase):
         self.assertIsNotNone(comp["rows"][2]["deltas"]["wer"])
         self.assertEqual([d["key"] for d in comp["config_differences"]], ["drop_every"])
         md = (sweep_dir / "summary.md").read_text()
-        self.assertIn("sw__drop_every-3", md)
+        self.assertIn("drop_every-3", md)
+        self.assertNotIn("sw__drop_every-3", md)  # compact tables: no repeated sweep prefix in cells
         self.assertIn("Failed configs: none", md)
         self.assert_private(self.hist)
         self.assertEqual(len(json.loads((self.hist / "index.json").read_text())), 3)
@@ -554,7 +576,7 @@ class SweepTests(BenchCase):
         bad = summary["results"][1]
         self.assertNotEqual(bad["run_id"], old)
         self.assertEqual((bad["error_code"], self.run_json(bad["run_id"])["status"]), ("stub_error", "error"))
-        row = summary["comparison"]["rows"][1]
+        row = next(r for r in summary["comparison"]["rows"] if r["run_id"] == bad["run_id"])
         self.assertEqual(row["status"], "error")
         self.assertIsNone(row["values"]["wer"])  # no metrics borrowed from the older successful run
         self.assertIn("Failed configs: bad", (sweep_dir / "summary.md").read_text())
