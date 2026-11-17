@@ -32,6 +32,9 @@ field extraction, search ranking and fact-checklist scoring before release.
   attributed WER with label mapping, and inline diff markup.
 - **`scripts/calibrate.py`**: blinded hand-scoring sheets and an auto-vs-human
   calibration report.
+- **`AGENTS.md`**, **`Makefile`**, **`doctor.sh`**: the rules for an agent that works in a
+  clone of this repository, `make test` and `make doctor`
+  (see [Working on this repository](#working-on-this-repository)).
 
 Everything is standard-library Python 3.9 or newer.
 
@@ -45,6 +48,13 @@ git clone https://github.com/itskeKs/reference-benchmark ~/.claude/skills/refere
 
 For a single project, clone it into `<project>/.claude/skills/reference-benchmark`
 instead.
+
+Check the install. This changes nothing; it reports the Python version and whether Claude
+Code finds the skill:
+
+```bash
+make -C ~/.claude/skills/reference-benchmark doctor
+```
 
 Claude loads the skill when you ask things like "how good is X", "benchmark these two
 models", "did the upgrade regress quality" or "sweep these parameters". You can also
@@ -81,6 +91,10 @@ This runs `python3 -m unittest discover -s scripts/tests` and then checks `docto
 An agent opened in this checkout gets its rules from [AGENTS.md](AGENTS.md) (`CLAUDE.md` is a
 symlink to it). `make doctor` checks that Python 3.9 or newer is installed and whether Claude Code
 can find this checkout as a skill. `make test` runs the unit tests; it must pass before a commit.
+
+You can also let an agent do the install: open Claude Code or Codex in a clone and say where the
+skill should go. `AGENTS.md` gives it the two install forms and the rule never to replace an
+existing skill directory without asking you.
 
 ## License
 
