@@ -71,8 +71,16 @@ documents the full contract.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s scripts/tests
+make test
 ```
+
+This runs `python3 -m unittest discover -s scripts/tests` and then checks `doctor.sh`.
+
+## Working on this repository
+
+An agent opened in this checkout gets its rules from [AGENTS.md](AGENTS.md) (`CLAUDE.md` is a
+symlink to it). `make doctor` checks that Python 3.9 or newer is installed and whether Claude Code
+can find this checkout as a skill. `make test` runs the unit tests; it must pass before a commit.
 
 ## License
 
